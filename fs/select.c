@@ -38,6 +38,7 @@
 
 /*
  * Estimate expected accuracy in ns from a timeval.
+ * 估计时间精度的辅助函数，用于计算 select/poll 的超时"宽松值" (slack)
  *
  * After quite a bit of churning around, we've settled on
  * a simple thing of taking 0.1% of the timeout as the
@@ -474,6 +475,22 @@ static inline void wait_key_set(poll_table *wait, unsigned long in,
 }
 
 static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec64 *end_time)
+ /*
+  * do_select(): select/poll 的核心实现函数
+  * @n: 最大文件描述符编号 + 1
+  * @fds: 包含感兴趣的文件描述符集合（输入）和结果（输出）
+  * @end_time: 超时截止时间（ktime_t 类型）
+  *
+  * 工作流程：
+  * 1. 获取有效的最大fd编号
+  * 2. 初始化poll_wqueues结构（用于管理等待队列）
+  * 3. 循环遍历所有fd，调用vfs_poll()检查每个fd的状态
+  * 4. 如果没有就绪的fd，则调用poll_schedule_timeout()进入睡眠等待
+  * 5. 直到有fd就绪、超时、或收到信号才返回
+  * 6. 返回就绪的文件描述符数量
+  *
+  * 注意：这是实际执行select逻辑的地方，是性能分析的关键点
+  */
 {
 	ktime_t expire, *to = NULL;
 	struct poll_wqueues table;
@@ -482,6 +499,7 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 	u64 slack = 0;
 	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
 	unsigned long busy_start = 0;
+	ktime_t pselect_start_time = ktime_get();
 
 	rcu_read_lock();
 	retval = max_select_fd(n, fds);
@@ -607,6 +625,11 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 	}
 
 	poll_freewait(&table);
+
+	ktime_t pselect_end_time = ktime_get();
+	ktime_t pselect_duration = ktime_sub(pselect_end_time, pselect_start_time);
+	trace_printk("pselect6: waited %lld ns, ret=%d\n",
+		     ktime_to_ns(pselect_duration), retval);
 
 	return retval;
 }
@@ -790,7 +813,23 @@ Efault:
 	user_read_access_end();
 	return -EFAULT;
 }
-
+/* 
+ * pselect6() 系统调用入口
+ * 
+ * pselect6 系统调用是 POSIX select 的超集，提供以下特性：
+ * 1. 支持纳秒级精度的 timespec 超时（而非 select 的 timeval 微秒级）
+ * 2. 支持第6个参数同时传递信号掩码和掩码大小，实现原子操作
+ * 
+ * 参数:
+ *   n      - 最大文件描述符编号 + 1
+ *   inp    - 读取文件描述符集合 (fd_set *)
+ *   outp   - 写入文件描述符集合
+ *   exp    - 异常条件文件描述符集合
+ *   tsp    - 超时时间 (struct __kernel_timespec *)
+ *   sig    - 信号掩码参数 (包含 sigset_t 指针和 size_t 大小)
+ * 
+ * 返回值: 已就绪的文件描述符数量，0 表示超时，-1 表示错误
+ */
 SYSCALL_DEFINE6(pselect6, int, n, fd_set __user *, inp, fd_set __user *, outp,
 		fd_set __user *, exp, struct __kernel_timespec __user *, tsp,
 		void __user *, sig)
@@ -883,6 +922,18 @@ out:
 
 static int do_poll(struct poll_list *list, struct poll_wqueues *wait,
 		   struct timespec64 *end_time)
+/*
+ * do_poll(): poll() 系统调用的核心实现
+ * @list: pollfd 链表，包含用户传递的所有文件描述符和感兴趣的事件
+ * @wait: poll_wqueues 结构，用于管理等待队列
+ * @end_time: 超时截止时间
+ *
+ * 与 do_select() 的区别：
+ * - do_select(): 使用 fd_set 位图（select 系统调用使用）
+ * - do_poll(): 使用 pollfd 数组（poll 系统调用使用）
+ *
+ * 工作流程与 do_select() 类似，但处理的是 pollfd 结构而非 fd_set
+ */
 {
 	poll_table* pt = &wait->pt;
 	ktime_t expire, *to = NULL;
@@ -1184,12 +1235,20 @@ int compat_set_fd_set(unsigned long nr, compat_ulong_t __user *ufdset,
  */
 
 /*
- * We can actually return ERESTARTSYS instead of EINTR, but I'd
- * like to be certain this leads to no problems. So I return
- * EINTR just for safety.
- *
- * Update: ERESTARTSYS breaks at least the xview clock binary, so
- * I'm trying ERESTARTNOHAND which restart only when you want to.
+ * pselect6 系统调用的内核实现
+ * 
+ * 本文件实现了 Linux 的 select/poll 机制，是 I/O 多路复用的核心组件。
+ * pselect6 的核心功能是：
+ *   - 监视多个文件描述符（fd），等待其变为可读/可写/异常
+ *   - 支持 nanosecond 精度的超时
+ *   - 支持原子地设置信号掩码
+ * 
+ * 调用层次（从外到内）：
+ *   1. SYSCALL_DEFINE6(pselect6)    - 系统调用入口
+ *   2. do_pselect()                 - 核心处理函数
+ *   3. core_sys_select()            - 内存分配和数据准备
+ *   4. do_select()                  - 实际轮询/等待
+ *   5. vfs_poll()                   - VFS 层调用具体文件系统的 poll
  */
 static int compat_core_sys_select(int n, compat_ulong_t __user *inp,
 	compat_ulong_t __user *outp, compat_ulong_t __user *exp,
@@ -1420,6 +1479,41 @@ COMPAT_SYSCALL_DEFINE5(ppoll_time32, struct pollfd __user *, ufds,
 	return poll_select_finish(&end_time, tsp, PT_OLD_TIMESPEC, ret);
 }
 #endif
+
+
+/*
+ * pselect6 系统调用完整注释
+ * ========================
+ *
+ * 1. 功能描述：
+ *    pselect6 是 POSIX select 的扩展版本，主要特性：
+ *    - 支持纳秒级精度的超时（相比 select 的微秒级）
+ *    - 支持原子地设置信号掩码（避免竞态条件）
+ *    - 用于 I/O 多路复用，监视多个文件描述符的可读/可写/异常状态
+ *
+ * 2. 组成部分：
+ *    - SYSCALL_DEFINE6(pselect6): 系统调用入口，参数处理和转换
+ *    - do_pselect(): 核心处理函数，设置信号掩码和超时
+ *    - core_sys_select(): 分配内存，复制用户数据到内核
+ *    - do_select(): 实际执行 select 逻辑，轮询文件描述符
+ *    - vfs_poll(): VFS 层调用具体文件系统的 poll 实现
+ *
+ * 3. 数据结构：
+ *    - fd_set_bits: 包含6个位图（输入/输出的 in/out/except）
+ *    - poll_wqueues: 管理等待队列的结构
+ *    - poll_table/poll_table_entry: 用于文件描述符等待的表
+ *
+ * 4. 调用流程：
+ *    用户空间 -> glibc -> syscall -> SYSCALL_DEFINE6(pselect6)
+ *    -> do_pselect() -> core_sys_select() -> do_select() -> vfs_poll()
+ *
+ * 5. 时间统计关键点（用于性能分析）：
+ *    - do_select() 入口：记录开始时间（ktime_get()）
+ *    - poll_schedule_timeout() 前后：记录等待时间
+ *    - do_select() 出口：记录结束时间，计算总耗时
+ *
+ *    推荐使用 trace_printk() 输出时间差，便于后续通过 ftrace 分析
+ */
 
 /* New compat syscall for 64 bit time_t*/
 COMPAT_SYSCALL_DEFINE5(ppoll_time64, struct pollfd __user *, ufds,

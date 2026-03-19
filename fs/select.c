@@ -475,130 +475,177 @@ static inline void wait_key_set(poll_table *wait, unsigned long in,
 }
 
 static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec64 *end_time)
- /*
-  * do_select(): select/poll 的核心实现函数
-  * @n: 最大文件描述符编号 + 1
-  * @fds: 包含感兴趣的文件描述符集合（输入）和结果（输出）
-  * @end_time: 超时截止时间（ktime_t 类型）
-  *
-  * 工作流程：
-  * 1. 获取有效的最大fd编号
-  * 2. 初始化poll_wqueues结构（用于管理等待队列）
-  * 3. 循环遍历所有fd，调用vfs_poll()检查每个fd的状态
-  * 4. 如果没有就绪的fd，则调用poll_schedule_timeout()进入睡眠等待
-  * 5. 直到有fd就绪、超时、或收到信号才返回
-  * 6. 返回就绪的文件描述符数量
-  *
-  * 注意：这是实际执行select逻辑的地方，是性能分析的关键点
-  */
 {
-	ktime_t expire, *to = NULL;
-	struct poll_wqueues table;
-	poll_table *wait;
-	int retval, i, timed_out = 0;
-	u64 slack = 0;
-	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
-	unsigned long busy_start = 0;
-	ktime_t pselect_start_time = ktime_get();
+	/*
+	 * do_select(): select/poll 的核心实现函数
+	 *
+	 * 功能说明：
+	 *   这个函数是 select() 和 poll() 系统调用的核心执行逻辑。
+	 *   它的作用是：监控多个文件描述符（fd），直到其中某个（或多个）变为"就绪"状态后才返回。
+	 *
+	 * 什么是"就绪"：
+	 *   - POLLIN: 有数据可读（输入缓冲区有数据）
+	 *   - POLLOUT: 可以写入数据（输出缓冲区有空间）
+	 *   - POLLPRI: 有紧急数据可读
+	 *
+	 * 调用场景：
+	 *   - 当程序需要同时等待多个 I/O 事件时（如同时读取多个网络连接或文件）
+	 *   - 例如：视频流处理中等待摄像头数据、网络服务器等待客户端请求
+	 *
+	 * @n: 最大文件描述符编号 + 1（即最大 fd 值加 1）
+	 * @fds: 包含感兴趣的文件描述符集合（输入）和就绪结果（输出）
+	 *       - fds->in:  关心读事件的 fd 集合（输入）
+	 *       - fds->out: 关心写事件的 fd 集合（输入）
+	 *       - fds->ex:  关心异常事件的 fd 集合（输入）
+	 *       - fds->res_in/out/ex: 就绪结果（输出）
+	 * @end_time: 超时截止时间，如果为 NULL 则无限等待
+	 *
+	 * 返回值：
+	 *   - > 0: 就绪的文件描述符数量
+	 *   - 0:   超时，没有 fd 变为就绪
+	 *   - < 0: 出错（如被信号中断）
+	 *
+	 * 工作流程：
+	 *   1. 获取有效的最大 fd 编号
+	 *   2. 初始化 poll_wqueues 结构（用于管理等待队列）
+	 *   3. 循环遍历所有 fd，调用 vfs_poll() 检查每个 fd 的状态
+	 *   4. 如果没有就绪的 fd，则调用 poll_schedule_timeout() 进入睡眠等待
+	 *   5. 直到有 fd 就绪、超时、或收到信号才返回
+	 *   6. 返回就绪的文件描述符数量
+	 *
+	 * 性能分析关键点：
+	 *   - vfs_poll() 是实际调用底层驱动 poll 函数的地方
+	 *   - poll_schedule_timeout() 是让进程进入睡眠的关键函数
+	 *   这两个函数是分析 I/O 延迟的核心位置
+	 */
 
+	/* ========== 变量定义部分 ========== */
+	ktime_t expire, *to = NULL;  /* expire: 超时到期时间, to: 指向超时的指针 */
+	struct poll_wqueues table;   /* poll_wqueues: 管理等待队列的结构 */
+	poll_table *wait;             /* wait: poll 表指针，用于文件就绪回调 */
+	int retval, i, timed_out = 0; /* retval: 返回值, i: 循环计数, timed_out: 超时标志 */
+	u64 slack = 0;                /* slack: 调度精度估算值 */
+	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0; /* busy_flag: 忙碌循环标志 */
+	unsigned long busy_start = 0; /* busy_start: 忙碌循环开始时间 */
+	ktime_t pselect_start_time = ktime_get(); /* 记录函数开始时间，用于性能跟踪 */
+
+	/* ========== 第一步：获取有效的最大 fd 编号 ========== */
 	rcu_read_lock();
-	retval = max_select_fd(n, fds);
+	retval = max_select_fd(n, fds);  /* max_select_fd: 获取有效的最大 fd */
 	rcu_read_unlock();
 
 	if (retval < 0)
 		return retval;
 	n = retval;
 
-	poll_initwait(&table);
+	/* ========== 第二步：初始化 poll_wqueues 结构 ========== */
+	poll_initwait(&table);  /* 初始化等待队列 */
 	wait = &table.pt;
+
+	/* ========== 第三步：处理零超时情况 ========== */
 	if (end_time && !end_time->tv_sec && !end_time->tv_nsec) {
-		wait->_qproc = NULL;
-		timed_out = 1;
+		wait->_qproc = NULL;  /* 禁用回调，直接轮询 */
+		timed_out = 1;        /* 标记为立即超时 */
 	}
 
+	/* ========== 第四步：估算超时调度精度 ========== */
 	if (end_time && !timed_out)
-		slack = select_estimate_accuracy(end_time);
+		slack = select_estimate_accuracy(end_time);  /* 估算合适的调度精度 */
 
-	retval = 0;
+	/* ========== 第五步：主循环开始 ========== */
+	retval = 0;  /* 初始化返回值为 0 */
 	for (;;) {
 		unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp;
 		bool can_busy_loop = false;
 
+		/* 指向 fd 集合的指针：in(输入)、out(输出)、ex(异常) */
 		inp = fds->in; outp = fds->out; exp = fds->ex;
+		/* 指向结果集合的指针 */
 		rinp = fds->res_in; routp = fds->res_out; rexp = fds->res_ex;
 
+		/* ========== 第六步：外层循环 - 遍历所有 fd 位图块 ========== */
 		for (i = 0; i < n; ++rinp, ++routp, ++rexp) {
 			unsigned long in, out, ex, all_bits, bit = 1, j;
 			unsigned long res_in = 0, res_out = 0, res_ex = 0;
 			__poll_t mask;
 
+			/* 读取当前位图块 */
 			in = *inp++; out = *outp++; ex = *exp++;
-			all_bits = in | out | ex;
+			all_bits = in | out | ex;  /* 合并所有感兴趣的位 */
 			if (all_bits == 0) {
-				i += BITS_PER_LONG;
+				i += BITS_PER_LONG;  /* 如果没有感兴趣的位，跳过整个块 */
 				continue;
 			}
 
+			/* ========== 第七步：内层循环 - 遍历位图块中的每个 fd ========== */
 			for (j = 0; j < BITS_PER_LONG; ++j, ++i, bit <<= 1) {
 				struct fd f;
 				if (i >= n)
 					break;
-				if (!(bit & all_bits))
+				if (!(bit & all_bits))  /* 如果该位不在感兴趣集合中，跳过 */
 					continue;
+
+				/* 初始化 mask 为无效标志 */
 				mask = EPOLLNVAL;
+				/* 获取 fd 对应的文件结构 */
 				f = fdget(i);
 				if (fd_file(f)) {
-					wait_key_set(wait, in, out, bit,
-						     busy_flag);
+					/* 设置等待键值，用于回调时判断哪些 fd 就绪 */
+					wait_key_set(wait, in, out, bit, busy_flag);
+					/* 调用 vfs_poll 检查文件状态，这是实际轮询的地方 */
 					mask = vfs_poll(fd_file(f), wait);
-
+					/* 释放 fd 引用 */
 					fdput(f);
 				}
+
+				/* ========== 第八步：检查 POLLIN (输入就绪) ========== */
 				if ((mask & POLLIN_SET) && (in & bit)) {
-					res_in |= bit;
-					retval++;
-					wait->_qproc = NULL;
+					res_in |= bit;   /* 标记该 fd 在输入集合中就绪 */
+					retval++;         /* 增加就绪计数 */
+					wait->_qproc = NULL;  /* 有 fd 就绪后禁用回调 */
 				}
+				/* ========== 第九步：检查 POLLOUT (输出就绪) ========== */
 				if ((mask & POLLOUT_SET) && (out & bit)) {
 					res_out |= bit;
 					retval++;
 					wait->_qproc = NULL;
 				}
+				/* ========== 第十步：检查 POLLEX (异常条件) ========== */
 				if ((mask & POLLEX_SET) && (ex & bit)) {
 					res_ex |= bit;
 					retval++;
 					wait->_qproc = NULL;
 				}
-				/* got something, stop busy polling */
+
+				/* 第十一步：如果有 fd 就绪，停止忙碌轮询 */
 				if (retval) {
 					can_busy_loop = false;
 					busy_flag = 0;
-
-				/*
-				 * only remember a returned
-				 * POLL_BUSY_LOOP if we asked for it
-				 */
-				} else if (busy_flag & mask)
+				} else if (busy_flag & mask)  /* 记住返回 POLL_BUSY_LOOP 的 socket */
 					can_busy_loop = true;
-
 			}
+
+			/* ========== 第十二步：保存结果到位图 ========== */
 			if (res_in)
 				*rinp = res_in;
 			if (res_out)
 				*routp = res_out;
 			if (res_ex)
 				*rexp = res_ex;
-			cond_resched();
+
+			cond_resched();  /* 让出 CPU，允许其他进程运行 */
 		}
-		wait->_qproc = NULL;
-		if (retval || timed_out || signal_pending(current))
+
+		/* 第十三步：检查是否需要退出循环 */
+		wait->_qproc = NULL;  /* 重置回调 */
+		if (retval || timed_out || signal_pending(current))  /* 有 fd 就绪 或 超时 或 有信号 */
 			break;
-		if (table.error) {
+		if (table.error) {    /* 如果有错误 */
 			retval = table.error;
 			break;
 		}
 
-		/* only if found POLL_BUSY_LOOP sockets && not out of time */
+		/* 第十四步：处理忙碌循环模式 */
 		if (can_busy_loop && !need_resched()) {
 			if (!busy_start) {
 				busy_start = busy_loop_current_time();
@@ -609,29 +656,55 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 		}
 		busy_flag = 0;
 
-		/*
-		 * If this is the first loop and we have a timeout
-		 * given, then we convert to ktime_t and set the to
-		 * pointer to the expiry value.
-		 */
+		/* ========== 第十五步：设置超时时间 ========== */
 		if (end_time && !to) {
+			/* 首次循环时，将 timespec64 转换为 ktime_t */
 			expire = timespec64_to_ktime(*end_time);
 			to = &expire;
 		}
 
-		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE,
-					   to, slack))
-			timed_out = 1;
+		/* ========== 第十六步：进入睡眠等待 ========== */
+		/* 调用 poll_schedule_timeout 进入睡眠，直到有 fd 就绪、超时或被信号唤醒 */
+		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE, to, slack))
+			timed_out = 1;  /* 如果返回 false，说明超时了 */
 	}
 
-	poll_freewait(&table);
+	/* ========== 第十七步：清理资源并返回 ========== */
+	poll_freewait(&table);  /* 释放等待队列资源 */
 
+	/* 记录函数结束时间和耗时 */
 	ktime_t pselect_end_time = ktime_get();
 	ktime_t pselect_duration = ktime_sub(pselect_end_time, pselect_start_time);
-	trace_printk("pselect6: waited %lld ns, ret=%d\n",
-		     ktime_to_ns(pselect_duration), retval);
 
-	return retval;
+	/* 获取第一个被监控的 fd 对应的文件名 */
+	char fname[64] = {0};
+	unsigned int fd_idx = 0;
+	struct fd f;
+	for (fd_idx = 0; fd_idx < n; fd_idx++) {
+		if (fds->in && (fds->in[fd_idx / BITS_PER_LONG] & (1UL << (fd_idx % BITS_PER_LONG)))) {
+			f = fdget(fd_idx);
+			if (!fd_empty(f)) {
+				struct file *file = fd_file(f);
+				if (file && file->f_path.dentry) {
+					char *name = (char *)file->f_path.dentry->d_name.name;
+					strncpy(fname, name, sizeof(fname) - 1);
+				}
+			}
+			fdput(f);
+			break;
+		}
+	}
+
+	if (fname[0])
+		trace_printk("pselect6: waited %lld ns, ret=%d, end_time=%lld s, fd=%u, file=%s\n",
+			     ktime_to_ns(pselect_duration), retval,
+			     ktime_divns(pselect_end_time, 1000000000), fd_idx, fname);
+	else
+		trace_printk("pselect6: waited %lld ns, ret=%d, end_time=%lld s\n",
+			     ktime_to_ns(pselect_duration), retval,
+			     ktime_divns(pselect_end_time, 1000000000));
+
+	return retval;  /* 返回就绪的 fd 数量 */
 }
 
 /*

@@ -1,0 +1,34 @@
+# 在树莓派或你的电脑上执行（建议 --depth=1 省空间，大概 800MB → 200MB 左右）
+git clone --depth=1 --branch rpi-6.12.y https://github.com/raspberrypi/linux.git ~/linux-rpi-6.12
+
+cd ~/linux-rpi-6.12
+
+# 构建配置
+export KERNEL=kernel_2712
+export ARCH=arm64
+make bcm2712_defconfig
+
+# 自定义内核版本，在.config里面
+CONFIG_LOCALVERSION="-MY_KERNEL"
+
+# 构建
+make -j8 Image.gz modules dtbs
+
+sudo mkdir mnt
+sudo mkdir mnt/boot
+sudo mkdir mnt/root
+sudo mount /dev/sda1 mnt/boot
+sudo mount /dev/sda2 mnt/root
+
+# 接下来，将内核模块安装到启动媒体上：
+sudo env PATH=$PATH make -j12 INSTALL_MOD_PATH=mnt/root modules_install
+
+# 创建当前内核的备份镜像，安装新的内核镜像、覆盖层、README，并卸载分区
+sudo cp mnt/boot/$KERNEL.img mnt/boot/$KERNEL-backup.img
+sudo cp arch/arm64/boot/Image mnt/boot/$KERNEL.img
+sudo cp arch/arm64/boot/dts/broadcom/*.dtb mnt/boot/
+sudo cp arch/arm64/boot/dts/overlays/*.dtb* mnt/boot/overlays/
+sudo cp arch/arm64/boot/dts/overlays/README mnt/boot/overlays/
+
+sudo umount mnt/boot
+sudo umount mnt/root

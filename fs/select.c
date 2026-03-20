@@ -528,6 +528,9 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0; /* busy_flag: 忙碌循环标志 */
 	unsigned long busy_start = 0; /* busy_start: 忙碌循环开始时间 */
 	ktime_t pselect_start_time = ktime_get(); /* 记录函数开始时间，用于性能跟踪 */
+	ktime_t sleep_start_time = 0; /* 记录进入睡眠的开始时间 */
+	ktime_t sleep_end_time = 0;   /* 记录从睡眠中唤醒的结束时间 */
+	ktime_t sleep_duration = 0;   /* 实际睡眠持续时间 */
 
 	/* ========== 第一步：获取有效的最大 fd 编号 ========== */
 	rcu_read_lock();
@@ -664,9 +667,15 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 		}
 
 		/* ========== 第十六步：进入睡眠等待 ========== */
+		/* 记录进入睡眠前的时间 */
+		sleep_start_time = ktime_get();
 		/* 调用 poll_schedule_timeout 进入睡眠，直到有 fd 就绪、超时或被信号唤醒 */
 		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE, to, slack))
 			timed_out = 1;  /* 如果返回 false，说明超时了 */
+		/* 记录从睡眠中唤醒后的时间 */
+		sleep_end_time = ktime_get();
+		/* 计算实际睡眠持续时间 */
+		sleep_duration = ktime_sub(sleep_end_time, sleep_start_time);
 	}
 
 	/* ========== 第十七步：清理资源并返回 ========== */
@@ -675,6 +684,9 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 	/* 记录函数结束时间和耗时 */
 	ktime_t pselect_end_time = ktime_get();
 	ktime_t pselect_duration = ktime_sub(pselect_end_time, pselect_start_time);
+
+	/* 计算上下文切换开销时间 */
+	ktime_t context_switch_time = ktime_sub(pselect_duration, sleep_duration);
 
 	/* 获取第一个被监控的 fd 对应的文件名 */
 	char fname[64] = {0};
@@ -695,14 +707,19 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 		}
 	}
 
+	/* 计算带有小数部分的时间戳 */
+	u64 total_ns = ktime_to_ns(pselect_end_time);
+	time64_t sec = total_ns / 1000000000;
+	u32 nsec = total_ns % 1000000000;
+
 	if (fname[0])
-		trace_printk("pselect6: waited %lld ns, ret=%d, end_time=%lld s, fd=%u, file=%s\n",
-			     ktime_to_ns(pselect_duration), retval,
-			     ktime_divns(pselect_end_time, 1000000000), fd_idx, fname);
+		trace_printk("pselect6: total=%lld ns, sleep=%lld ns, context=%lld ns, ret=%d, end_time=%lld.%09u s, fd=%u, file=%s\n",
+			     ktime_to_ns(pselect_duration), ktime_to_ns(sleep_duration), ktime_to_ns(context_switch_time),
+			     retval, sec, nsec, fd_idx, fname);
 	else
-		trace_printk("pselect6: waited %lld ns, ret=%d, end_time=%lld s\n",
-			     ktime_to_ns(pselect_duration), retval,
-			     ktime_divns(pselect_end_time, 1000000000));
+		trace_printk("pselect6: total=%lld ns, sleep=%lld ns, context=%lld ns, ret=%d, end_time=%lld.%09u s\n",
+			     ktime_to_ns(pselect_duration), ktime_to_ns(sleep_duration), ktime_to_ns(context_switch_time),
+			     retval, sec, nsec);
 
 	return retval;  /* 返回就绪的 fd 数量 */
 }

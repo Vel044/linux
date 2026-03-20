@@ -192,6 +192,10 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 	int ret, cmd = op & FUTEX_CMD_MASK;
 	ktime_t t, *tp = NULL;
 	struct timespec64 ts;
+	ktime_t futex_start_time = ktime_get(); /* 记录函数开始时间 */
+	ktime_t sleep_start_time = 0; /* 记录进入睡眠的开始时间 */
+	ktime_t sleep_end_time = 0;   /* 记录从睡眠中唤醒的结束时间 */
+	ktime_t sleep_duration = 0;   /* 实际睡眠持续时间 */
 
 	if (utime && futex_cmd_has_timeout(cmd)) {
 		if (unlikely(should_fail_futex(!(op & FUTEX_PRIVATE_FLAG))))
@@ -204,7 +208,30 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 		tp = &t;
 	}
 
-	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
+	/* 检查是否是等待操作，需要记录睡眠时间 */
+	if (futex_cmd_has_timeout(cmd)) {
+		sleep_start_time = ktime_get();
+	}
+
+	ret = do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
+
+	/* 记录睡眠结束时间和计算睡眠持续时间 */
+	if (futex_cmd_has_timeout(cmd)) {
+		sleep_end_time = ktime_get();
+		sleep_duration = ktime_sub(sleep_end_time, sleep_start_time);
+	}
+
+	/* 计算总耗时和CPU占用时间 */
+	ktime_t futex_end_time = ktime_get();
+	ktime_t futex_duration = ktime_sub(futex_end_time, futex_start_time);
+	ktime_t cpu_time = ktime_sub(futex_duration, sleep_duration);
+
+	/* 输出统计信息 */
+	trace_printk("futex: op=%d, val=%u, ret=%d, total=%lld ns, cpu=%lld ns, sleep=%lld ns\n",
+			cmd, val, ret, ktime_to_ns(futex_duration),
+			ktime_to_ns(cpu_time), ktime_to_ns(sleep_duration));
+
+	return ret;
 }
 
 /**

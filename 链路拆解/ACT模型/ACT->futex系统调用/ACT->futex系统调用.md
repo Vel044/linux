@@ -16,6 +16,54 @@ x = self.linear2(self.dropout(self.activation(self.linear1(x))))
 self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
 ```
 
+### 5. 并行两条等待链路示意图（lerobot / glibc / kernel）
+
+下面把两条“从 Python 出发”的调用链路合在一张图里：
+
+1) 计算分支：`ACT -> torch.nn` 的 CPU 并行（OpenMP / caffe2 pthreadpool）在需要同步时会退化到 `futex` 被动等待。  
+2) 读取分支：后台 `_read_loop` 调用 OpenCV/V4L2 取帧；当队列没帧（`EAGAIN`）时走 `select -> glibc -> pselect6_time64`，由内核 wait queue 在 USB 摄像头就绪时唤醒。
+
+```mermaid
+flowchart LR
+    %% 三个大方框：用户态(lerobot) / glibc / 内核
+    subgraph U[lerobot 用户态 / 应用层]
+        direction TB
+        A[Python：ACT 推理入口<br/>ACT -> torch.nn（矩阵分解/注意力等CPU算子）]
+        W[torch CPU 并行线程池<br/>OpenMP / caffe2 pthreadpool workers]
+        R[后台读取线程 _read_loop<br/>grabFrame -> tryIoctl VIDIOC_DQBUF<br/>若无帧 EAGAIN -> select 等待]
+    end
+
+    subgraph G[glibc 用户态（stdlib / pthread 语义）]
+        direction TB
+        C1[线程同步：隐式屏障/cond->wait 先自旋后被动休眠]
+        F[触发 futex 被动等待 进入 Linux 阻塞]
+        S1[select 等待 超时由 glibc 设定]
+        P[系统调用：pselect6_time64 由 select 换壳]
+    end
+
+    subgraph K[kernel 内核态]
+        direction TB
+        KF[futex wait queue<br/>线程睡眠/被唤醒]
+        KV[V4L2/USB wait queue<br/>等待新视频帧就绪]
+    end
+
+    %% 计算分支：futex 等待
+    A --> W
+    A --> R
+    W --> C1
+    C1 --> F --> KF
+    KF --> W
+
+    %% 读取分支：pselect6 等待
+    R --> S1
+    S1 --> P --> KV
+    KV --> R
+
+    %% 注释：两条支线都“最终进入内核等待”，只是等待条件不同
+    %% - 计算：线程同步事件（cond/futex）
+    %% - 读取：USB 摄像头/V4L2 缓冲区就绪（pselect6）
+```
+
 ### 2. torchvision
 
 `vision/torchvision/models/resnet.py`中`ResNet.forward(x)`跳转到`_forward_impl(x)`。

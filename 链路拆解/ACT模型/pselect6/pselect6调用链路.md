@@ -165,7 +165,7 @@ bool CvCaptureCAM_V4L::tryIoctl(unsigned long ioctlCode, void *parameter, bool f
             return false;
         }
 
-        // ====== 这里是 select 调用！======
+
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(deviceHandle, &fds);
@@ -177,7 +177,7 @@ bool CvCaptureCAM_V4L::tryIoctl(unsigned long ioctlCode, void *parameter, bool f
         tv.tv_usec = 0;
 
         errno = 0;
-        result = select(deviceHandle + 1, &fds, NULL, NULL, &tv);
+        result = select(deviceHandle + 1, &fds, NULL, NULL, &tv);           // ====== 这里是 select 调用！======
 
         if (0 == result)
         {
